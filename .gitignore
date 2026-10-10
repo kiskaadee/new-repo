@@ -1,0 +1,12 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment & Secrets
+.env
+*.local
+
+# Linters & Test Caches
+.ruff_cache/
+.pytest_cache/
