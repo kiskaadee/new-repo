@@ -25,6 +25,13 @@ class TestArgParsing(unittest.TestCase):
         self.assertFalse(args.no_mirror)
         self.assertFalse(args.no_clone)
 
+    def test_omitted_name_defaults_to_none(self) -> None:
+        import sys
+
+        sys.argv = ["new-repo"]
+        args = parse_args()
+        self.assertIsNone(args.name)
+
     def test_custom_flags(self) -> None:
         import sys
 

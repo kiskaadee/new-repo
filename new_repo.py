@@ -153,7 +153,12 @@ class SecretProvider:
         def get_val(key: str) -> str | None:
             return os.environ.get(key) or dotenv.get(key)
 
-        config_secrets = Path.home() / "Config" / "secrets.yaml"
+        secrets_file_env = os.environ.get("SECRETS_FILE")
+        config_secrets = (
+            Path(secrets_file_env)
+            if secrets_file_env
+            else Path.home() / "Config" / "secrets.yaml"
+        )
         homelab_secrets = (
             Path(os.environ["HOMELAB_SECRETS_FILE"])
             if "HOMELAB_SECRETS_FILE" in os.environ
@@ -403,6 +408,84 @@ def clone_locally(gitea_host: str, user: str, repo_name: str, target_dir: Path) 
         print(f"⚠️  Failed to clone repository: {e.stderr.strip()}", file=sys.stderr)
 
 
+def link_and_push_existing(
+    gitea_host: str, user: str, repo_name: str, target_dir: Path
+) -> None:
+    """Links an existing local git repository to the new Gitea remote and pushes commits."""
+    clone_url = f"git@{gitea_host}:{user}/{repo_name}.git"
+    print(f"🔗 Setting remote 'origin' to {clone_url}...")
+    try:
+        remotes_out = subprocess.run(
+            ["git", "remote"],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        remotes = remotes_out.stdout.split()
+        if "origin" in remotes:
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", clone_url],
+                cwd=target_dir,
+                check=True,
+            )
+            print("   Updated existing 'origin' remote URL.")
+        else:
+            subprocess.run(
+                ["git", "remote", "add", "origin", clone_url],
+                cwd=target_dir,
+                check=True,
+            )
+            print("   Added 'origin' remote.")
+
+        # Detect current branch
+        branch_res = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        current_branch = branch_res.stdout.strip() or "main"
+        print(f"🚀 Pushing branch '{current_branch}' to origin...")
+        subprocess.run(
+            ["git", "push", "-u", "origin", current_branch],
+            cwd=target_dir,
+            check=True,
+        )
+        print(f"✅ Successfully pushed '{current_branch}' to Gitea!")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Failed to link/push repository: {e}", file=sys.stderr)
+
+
+def determine_target(name_arg: str | None) -> tuple[str, Path, bool]:
+    """Determine (repo_name, target_dir, is_existing_git).
+
+    Returns:
+        repo_name: The clean repository name for Gitea and GitHub.
+        target_dir: The directory on disk.
+        is_existing_git: True if target_dir is an existing git repository.
+    """
+    cwd = Path.cwd()
+    if not name_arg or name_arg.strip() == ".":
+        repo_name = cwd.name
+        target_dir = cwd
+    else:
+        name_clean = name_arg.strip()
+        if name_clean == cwd.name:
+            repo_name = name_clean
+            target_dir = cwd
+        elif (cwd / name_clean).is_dir():
+            repo_name = name_clean
+            target_dir = cwd / name_clean
+        else:
+            repo_name = name_clean
+            target_dir = cwd / name_clean
+
+    is_existing_git = (target_dir / ".git").is_dir()
+    return repo_name, target_dir, is_existing_git
+
+
 # ==============================================================================
 # CLI Entrypoint & Workflow
 # ==============================================================================
@@ -416,8 +499,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "name",
+        nargs="?",
+        default=None,
         type=str,
-        help="Name of the repository to create",
+        help="Name of the repository to create (defaults to current directory if omitted or '.')",
     )
     parser.add_argument(
         "-p",
@@ -466,15 +551,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Main orchestration flow."""
     args = parse_args()
-    repo_name: str = args.name.strip()
+    repo_name, target_dir, is_existing_git = determine_target(args.name)
     is_private: bool = not args.public
 
     if not repo_name:
-        print("Error: Repository name cannot be empty.", file=sys.stderr)
+        print("Error: Repository name cannot be determined.", file=sys.stderr)
         sys.exit(1)
 
     print(f"🚀 Initializing repository provisioning: '{repo_name}'")
     print(f"   Visibility: {'Private' if is_private else 'Public'}")
+    if is_existing_git:
+        print(f"   Mode: Existing local repository at '{target_dir}'")
+    else:
+        print(f"   Mode: Greenfield creation at '{target_dir}'")
 
     # 1. Resolve Credentials
     creds = SecretProvider.resolve()
@@ -487,11 +576,23 @@ def main() -> None:
         user=creds.github_user,
         token=creds.github_token,
     )
+    gitea_host = creds.gitea_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
 
     # 2. Provision Gitea Primary Repository
     gitea_html_url: str | None = None
     try:
-        if args.template:
+        if is_existing_git:
+            print(
+                "🏗️  Creating empty primary repository on Gitea (preserving local history)..."
+            )
+            res = gitea_client.create_repo(
+                name=repo_name,
+                private=is_private,
+                description=args.description,
+                auto_init=False,  # CRUCIAL: Do not create remote README/license to prevent divergent commit histories
+                license_name="",
+            )
+        elif args.template:
             template_parts = args.template.split("/", 1)
             if len(template_parts) == 2:
                 tmpl_owner, tmpl_name = template_parts[0], template_parts[1]
@@ -562,16 +663,20 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-    # 4. Clone Locally
-    if not args.no_clone:
-        gitea_host = (
-            creds.gitea_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+    # 4. Local Git Workflow
+    if is_existing_git:
+        link_and_push_existing(
+            gitea_host=gitea_host,
+            user=creds.gitea_user,
+            repo_name=repo_name,
+            target_dir=target_dir,
         )
+    elif not args.no_clone:
         clone_locally(
             gitea_host=gitea_host,
             user=creds.gitea_user,
             repo_name=repo_name,
-            target_dir=Path.cwd() / repo_name,
+            target_dir=target_dir,
         )
 
     # 5. Final Summary
@@ -579,8 +684,7 @@ def main() -> None:
     print(f"   Primary Forge: {gitea_html_url}")
     if github_html_url:
         print(f"   Backup Mirror: {github_html_url}")
-    if not args.no_clone:
-        print(f"   Working Tree:  {Path.cwd() / repo_name}")
+    print(f"   Working Tree:  {target_dir}")
 
 
 if __name__ == "__main__":
