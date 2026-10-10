@@ -21,6 +21,7 @@ Architecture Decision Records (ADRs) are maintained in [`docs/adr/`](docs/adr/):
 - [**ADR 002**: Environment Variables as Primary Configuration Interface with Pluggable Secret Resolvers](docs/adr/0002-environment-variables-as-primary-interface-with-sops-fallback.md)
 - [**ADR 003**: Dual-Forge Topology with Automated Push Mirroring and Retain-and-Report Error Policy](docs/adr/0003-dual-forge-topology-with-automated-push-mirroring.md)
 - [**ADR 004**: Existing Repository Linking and Auto-Detection](docs/adr/0004-existing-repository-linking-and-auto-detection.md)
+- [**ADR 005**: GitHub-to-Gitea Migration with Automated Push Mirroring](docs/adr/0005-github-to-gitea-migration-with-automated-push-mirroring.md)
 
 ---
 
@@ -33,6 +34,7 @@ Arguments:
   name                  Optional repository name (defaults to current directory if omitted or '.')
 
 Options:
+  --migrate [URL]       Migrate an existing GitHub repo to Gitea with automated push mirroring (URL or auto-detect from local origin)
   -p, --public          Make repository public (default: private)
   -d, --description     Optional repository description string
   -l, --license         License template identifier (default: UNLICENSE, pass "" to disable)
@@ -60,6 +62,13 @@ new-repo private-notes --no-mirror
 
 # 5. Public open-source repository with MIT license
 new-repo utility-lib --public --license MIT
+
+# 6. Migrate an existing GitHub repository to Gitea with push mirror
+new-repo --migrate https://github.com/my-org/existing-service
+
+# 7. Migrate repository in-place from inside a local checkout
+cd ~/Projects/existing-service
+new-repo --migrate
 ```
 
 ---
@@ -137,6 +146,35 @@ sequenceDiagram
     opt Local Clone Enabled (Default)
         CLI->>Git: git clone git@<gitea-host>:<user>/<repo>.git
         Git-->>CLI: Working tree cloned to ./<repo-name>
+    end
+```
+
+### Migration Workflow (`--migrate`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Developer
+    participant CLI as new-repo (--migrate)
+    participant Gitea as Gitea API (Primary)
+    participant GitHub as GitHub (Source)
+    participant Git as Local Working Tree
+
+    User->>CLI: new-repo --migrate [github-target]
+    CLI->>Gitea: GET /api/v1/repos/{user}/{repo} (Conflict Check)
+    alt Repo Exists
+        Gitea-->>CLI: 200 OK (Abort migration)
+    else Repo Does Not Exist
+        CLI->>Gitea: POST /api/v1/repos/migrate (mirror=False, auth_token=gh_token)
+        Gitea->>GitHub: Server-to-server clone of branches, tags, and commits
+        Gitea-->>CLI: Repository imported
+        CLI->>Gitea: POST /api/v1/repos/{user}/{repo}/push_mirrors
+        Gitea-->>CLI: Push mirror registered (sync on commit)
+        opt Inside Local Git Repo
+            CLI->>Git: Rename remote 'origin' -> 'github'
+            CLI->>Git: Add remote 'origin' -> Gitea clone URL
+            CLI->>Git: git branch --set-upstream-to=origin/<branch>
+        end
     end
 ```
 
