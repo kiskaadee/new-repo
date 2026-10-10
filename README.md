@@ -1,136 +1,159 @@
-# 🚀 `new-repo` — Automated Repository Provisioning CLI
+# `new-repo` — Automated Repository Provisioning CLI
 
-`new-repo` is a lightweight, zero-dependency Python 3 command-line utility that automates repository provisioning across a hybrid Git topology:
-- **Primary Forge**: Self-hosted Gitea instance (`gitea.roadtotech.me`).
-- **Offsite Backup Forge**: GitHub (`github.com`) via automated push mirroring.
+`new-repo` is a portable, zero-dependency Python 3 command-line utility designed to automate repository provisioning across a dual-forge Git topology:
+- **Primary Forge**: A self-hosted Gitea instance for local sovereignty and CI/CD automation.
+- **Backup Forge**: GitHub for offsite redundancy via automated server-side push mirroring.
 
-It eliminates repetitive manual setup by providing sensible defaults (Gitea as primary, automated GitHub push mirroring, `UNLICENSE` default, private visibility, auto-clone locally into `$PWD/<name>`) while supporting Gitea repository templates and optional standalone configurations.
+It automates the multi-step setup required to create a repository, establish push mirroring, and prepare a local working tree in a single command.
 
 ---
 
-## 🎯 Architecture & Design Principles
+## 🎯 Key Design Principles
 
-1. **Zero External Dependencies**: Implemented strictly with the Python 3 standard library (`urllib.request`, `argparse`, `json`, `subprocess`, `dataclasses`, `typing`). No virtual environments, compilation steps, or pip packages required.
-2. **12-Factor Environment Configuration**: Standard environment variables (`GITEA_TOKEN`, `GITHUB_TOKEN`) serve as the primary contract. The tool runs anywhere—inside or outside Nix, locally, or in CI/CD pipelines—with no code modifications.
-3. **Transparent SOPS Fallback**: For daily workstation usage, when environment variables are not exported in the shell, credentials resolve transparently from SOPS-encrypted files (`~/Config/secrets.yaml` or legacy `Homelab` secrets) in process memory.
-4. **Strict Typing & Linting**: Built with full static type annotations passing **Pyright** with 0 errors and styled with **Ruff**.
+1. **Zero External Dependencies**: Built strictly with Python 3 standard library modules (`urllib.request`, `argparse`, `json`, `subprocess`, `dataclasses`, `typing`). Requires no virtual environment, compilation step, or third-party package installation.
+2. **Universal Portability (12-Factor)**: Standard environment variables (`GITEA_TOKEN`, `GITHUB_TOKEN`) and optional `.env` files serve as the primary configuration contract. The utility runs out-of-the-box on any POSIX system, container, or CI/CD runner.
+3. **In-Memory Credential Safety**: Tokens are injected exclusively via native HTTPS authorization headers. Secrets are never passed as command-line arguments to subprocesses, preventing exposure in system process tables (`ps`, `/proc/$PID/cmdline`) or persistent disk logs.
+4. **Resilient Failure Recovery**: Adheres to a *retain-and-report* policy. If backup mirror provisioning or push mirror registration encounters an error after the primary repository is created, the primary repository is preserved and diagnostic URLs are printed for manual review.
+5. **Strict Static Typing**: Enforces full static type hints validated via **Pyright** and formatted/linted via **Ruff**.
 
-See our Architecture Decision Records in [`docs/adr/`](docs/adr/):
+Architecture Decision Records (ADRs) are maintained in [`docs/adr/`](docs/adr/):
 - [**ADR 001**: Adopt Zero-Dependency Python Over Compiled Rust](docs/adr/0001-adopt-zero-dependency-python.md)
 - [**ADR 002**: Environment Variables as Primary Configuration Interface with Pluggable Secret Resolvers](docs/adr/0002-environment-variables-as-primary-interface-with-sops-fallback.md)
 - [**ADR 003**: Dual-Forge Topology with Automated Push Mirroring and Retain-and-Report Error Policy](docs/adr/0003-dual-forge-topology-with-automated-push-mirroring.md)
+- [**ADR 004**: Existing Repository Linking and Auto-Detection](docs/adr/0004-existing-repository-linking-and-auto-detection.md)
 
 ---
 
-## 💻 CLI Usage
+## 💻 CLI Specification
 
 ```text
-Usage: new-repo <NAME> [OPTIONS]
+Usage: new-repo [NAME] [OPTIONS]
 
 Arguments:
-  name                  Name of the repository to create
+  name                  Optional repository name (defaults to current directory if omitted or '.')
 
 Options:
   -p, --public          Make repository public (default: private)
-  -d, --description     Optional repository description
-  -l, --license         License template identifier (default: UNLICENSE)
+  -d, --description     Optional repository description string
+  -l, --license         License template identifier (default: UNLICENSE, pass "" to disable)
   -t, --template        Optional Gitea template repository ('[owner/]template-name')
   -M, --no-mirror       Disable automatic offsite push mirroring to GitHub
-  --no-clone            Skip cloning repository locally after creation
+  --no-clone            Skip cloning the repository locally after creation
   -h, --help            Show help message and exit
 ```
 
 ### Examples
 
 ```bash
-# 1. Standard creation (Gitea + GitHub push mirror + UNLICENSE + private + auto-clone)
-new-repo my-microservice
+# 1. Standard greenfield creation (Private Gitea + GitHub push mirror + UNLICENSE + auto-clone)
+new-repo service-api
 
-# 2. Generate from a Gitea template repository
-new-repo auth-api --template template-python-api
+# 2. Attach remotes & push an existing local repository
+cd ~/Projects/my-existing-app
+new-repo
 
-# 3. Local-only Gitea repo (no GitHub mirror)
+# 3. Provision from an existing Gitea template
+new-repo web-client --template template-react-app
+
+# 4. Local-only repository (no GitHub mirror)
 new-repo private-notes --no-mirror
 
-# 4. Public repository with MIT license
-new-repo open-tool --public --license MIT
+# 5. Public open-source repository with MIT license
+new-repo utility-lib --public --license MIT
 ```
 
 ---
 
-## 🔐 Credentials Configuration
+## 🔐 Credentials & Configuration
 
-### Option A: Standard Environment Variables (Any System / CI)
-Export credentials in your environment or place them in a `.env` file:
+### 1. Environment Variables (Universal / CI/CD)
+The script resolves credentials from standard environment variables:
+
 ```bash
-export GITEA_TOKEN="your_gitea_api_token"
-export GITHUB_TOKEN="your_github_token"
-export GITEA_URL="https://gitea.roadtotech.me"  # optional, default
-export GITEA_USER="kiskaadee"                   # optional, default
-export GITHUB_USER="kiskaadee"                  # optional, default
+# Required
+export GITEA_TOKEN="your_gitea_personal_access_token"
+export GITHUB_TOKEN="your_github_personal_access_token"
+
+# Optional overrides (defaults shown)
+export GITEA_URL="https://gitea.example.com"
+export GITEA_USER="git_username"
+export GITHUB_USER="github_username"
 ```
 
-### Option B: SOPS Workstation Encryption (Workstation Default)
-On your laptop, store tokens in `~/Config/secrets.yaml`:
-```bash
-sops ~/Config/secrets.yaml
+### 2. Local `.env` File
+Alternatively, create a `.env` file in the working directory or project root:
+
+```env
+GITEA_TOKEN=your_gitea_token
+GITHUB_TOKEN=your_github_token
+GITEA_URL=https://gitea.example.com
+GITEA_USER=git_username
+GITHUB_USER=github_username
 ```
+
+### 3. Optional Workstation SOPS Integration
+When environment variables are unset, the built-in `SecretProvider` optionally checks for SOPS-encrypted configuration files (e.g. `~/Config/secrets.yaml`), extracting values directly into process memory without persisting plaintext tokens to disk:
+
 ```yaml
 system:
-  gh_repo_token: <github_pat>
+  gh_repo_token: <github_token>
 gitea:
-  api_token: <gitea_pat>
+  api_token: <gitea_token>
 ```
 
 ---
 
-## 🏛️ System Workflow
+## 🏛️ Provisioning Architecture & Workflow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Developer (Laptop)
+    actor User as Developer / CI Runner
     participant CLI as new-repo (Python 3)
-    participant SP as SecretProvider (Env / SOPS RAM)
+    participant SP as SecretProvider (Env / .env / SOPS)
     participant Gitea as Gitea API (Primary)
     participant GitHub as GitHub API (Backup)
     participant Git as Local Git
 
     User->>CLI: new-repo <repo-name> [flags]
-    CLI->>SP: Resolve credentials
-    SP-->>CLI: (Gitea token, GitHub token)
+    CLI->>SP: Resolve API credentials
+    SP-->>CLI: Credentials (Gitea token, GitHub token)
     
-    alt Using Template (-t <template>)
-        CLI->>Gitea: POST /repos/{owner}/{template}/generate
-        Gitea-->>CLI: Repo created from template
-    else Standard Repo
-        CLI->>Gitea: POST /user/repos (with license & init)
-        Gitea-->>CLI: Repo created
+    alt Template Repo Specified (-t <template>)
+        CLI->>Gitea: POST /api/v1/repos/{owner}/{template}/generate
+        Gitea-->>CLI: Primary repository generated
+    else Standard Repository
+        CLI->>Gitea: POST /api/v1/user/repos (with license & auto-init)
+        Gitea-->>CLI: Primary repository created
     end
 
-    opt Mirroring Enabled (Default)
-        CLI->>GitHub: POST /user/repos (create empty target repo)
-        GitHub-->>CLI: 201 Created
-        CLI->>Gitea: POST /repos/{owner}/{repo}/push_mirrors
-        Gitea-->>CLI: Push Mirror Registered (sync on commit)
+    opt Push Mirroring Enabled (Default)
+        CLI->>GitHub: POST https://api.github.com/user/repos (empty target)
+        GitHub-->>CLI: Mirror target created
+        CLI->>Gitea: POST /api/v1/repos/{owner}/{repo}/push_mirrors
+        Gitea-->>CLI: Push mirror registered (sync on commit)
     end
 
-    opt Auto-clone Enabled (Default)
-        CLI->>Git: git clone git@gitea.roadtotech.me:user/repo.git
-        Git-->>CLI: Working tree ready in $PWD/<repo-name>
+    opt Local Clone Enabled (Default)
+        CLI->>Git: git clone git@<gitea-host>:<user>/<repo>.git
+        Git-->>CLI: Working tree cloned to ./<repo-name>
     end
 ```
 
 ---
 
-## 🧪 Verification & Development
+## 🧪 Development & Quality Assurance
 
-Run static checks using the configured toolchains:
+Run verification commands using the standard Python toolchain:
+
 ```bash
-# Type check
-pyright new_repo.py
+# Execute unit tests
+python3 test_new_repo.py
 
-# Lint & Format checks
-ruff check new_repo.py
-ruff format --check new_repo.py
+# Static type checking
+pyright new_repo.py test_new_repo.py
+
+# Linting and formatting
+ruff check new_repo.py test_new_repo.py
+ruff format --check new_repo.py test_new_repo.py
 ```
