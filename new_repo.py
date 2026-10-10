@@ -307,6 +307,55 @@ class GiteaClient:
         path = f"/api/v1/repos/{template_owner}/{template_name}/generate"
         return self._request("POST", path, payload)
 
+    def repo_exists(self, owner: str, name: str) -> bool:
+        """Check if a repository already exists on Gitea under the given owner."""
+        url = f"{self.base_url}/api/v1/repos/{owner}/{name}"
+        req = urllib.request.Request(
+            url=url,
+            headers={
+                "Authorization": f"token {self.token}",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            raw_err = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Gitea API error ({e.code} {e.reason}): {raw_err}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Gitea network error: {e.reason}") from e
+
+    def migrate_repo(
+        self,
+        clone_addr: str,
+        repo_name: str,
+        github_token: str,
+        private: bool = True,
+        description: str = "",
+    ) -> dict[str, Any]:
+        """Import an existing GitHub repository server-side into Gitea.
+
+        Uses Gitea's POST /api/v1/repos/migrate with mirror=False to perform
+        a complete one-time import of all git branches, tags, and commits.
+        """
+        payload = {
+            "clone_addr": clone_addr,
+            "auth_token": github_token,
+            "repo_name": repo_name,
+            "repo_owner": self.user,
+            "service": "github",
+            "mirror": False,
+            "private": private,
+            "description": description,
+        }
+        return self._request("POST", "/api/v1/repos/migrate", payload)
+
     def create_push_mirror(
         self,
         repo_name: str,
@@ -486,6 +535,143 @@ def determine_target(name_arg: str | None) -> tuple[str, Path, bool]:
     return repo_name, target_dir, is_existing_git
 
 
+def parse_github_target(target_str: str | None, cwd: Path) -> tuple[str, str, str]:
+    """Parse a GitHub target string or detect it from local git remotes.
+
+    Args:
+        target_str: GitHub URL (HTTPS, SSH) or shorthand ('owner/repo').
+            If None or empty, auto-detects from the local 'origin' remote in cwd.
+        cwd: Current working directory for auto-detection.
+
+    Returns:
+        tuple of (repo_name, github_owner, github_clone_url)
+
+    Raises:
+        ValueError: If target string cannot be parsed as a valid GitHub repository.
+        RuntimeError: If auto-detection fails because cwd lacks a GitHub remote.
+    """
+    raw = target_str.strip() if target_str else ""
+
+    if not raw:
+        # Auto-detect from local git repo
+        if not (cwd / ".git").is_dir():
+            raise RuntimeError(
+                "No GitHub URL provided, and current directory is not a Git repository. "
+                "Please specify a target (e.g. --migrate https://github.com/owner/repo)."
+            )
+        try:
+            origin_url = subprocess.check_output(
+                ["git", "remote", "get-url", "origin"],
+                cwd=cwd,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            raw = origin_url
+            print(f"🔍 Auto-detected GitHub target from local origin: {raw}")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                "Could not detect 'origin' remote from current Git repository. "
+                "Please specify a target (e.g. --migrate https://github.com/owner/repo)."
+            ) from e
+
+    clean = raw.strip().rstrip("/").removesuffix(".git")
+
+    owner: str = ""
+    name: str = ""
+
+    if "github.com" in clean:
+        # Matches https://github.com/owner/repo or git@github.com:owner/repo
+        if ":" in clean and "@" in clean:
+            path_part = clean.split(":", 1)[1]
+        else:
+            path_part = clean.split("github.com/", 1)[1]
+
+        parts = [p for p in path_part.split("/") if p]
+        if len(parts) >= 2:
+            owner, name = parts[0], parts[1]
+    elif "/" in clean:
+        parts = [p for p in clean.split("/") if p]
+        if len(parts) == 2:
+            owner, name = parts[0], parts[1]
+
+    if not owner or not name:
+        raise ValueError(
+            f"Could not parse GitHub repository owner and name from '{raw}'. "
+            "Expected formats: https://github.com/owner/repo, git@github.com:owner/repo.git, or owner/repo."
+        )
+
+    clone_url = f"https://github.com/{owner}/{name}.git"
+    return name, owner, clone_url
+
+
+def reconfigure_local_remotes(target_dir: Path, gitea_clone_url: str) -> None:
+    """Reconfigures local git remotes for a migrated repository.
+
+    Renames existing 'origin' to 'github', sets Gitea as the new 'origin',
+    and updates upstream tracking for the active branch.
+    """
+    try:
+        remotes_out = subprocess.run(
+            ["git", "remote"],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        remotes = remotes_out.stdout.split()
+
+        if "origin" in remotes:
+            if "github" in remotes:
+                print("   Remote 'github' already exists. Removing legacy 'origin'...")
+                subprocess.run(
+                    ["git", "remote", "remove", "origin"],
+                    cwd=target_dir,
+                    check=True,
+                )
+            else:
+                print("🔄 Renaming existing remote 'origin' to 'github'...")
+                subprocess.run(
+                    ["git", "remote", "rename", "origin", "github"],
+                    cwd=target_dir,
+                    check=True,
+                )
+
+        print(f"🔗 Setting new primary remote 'origin' to {gitea_clone_url}...")
+        subprocess.run(
+            ["git", "remote", "add", "origin", gitea_clone_url],
+            cwd=target_dir,
+            check=True,
+        )
+
+        # Detect active branch
+        branch_res = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        active_branch = branch_res.stdout.strip() or "main"
+        print(
+            f"🚀 Updating upstream tracking for branch '{active_branch}' to origin..."
+        )
+        subprocess.run(
+            [
+                "git",
+                "branch",
+                f"--set-upstream-to=origin/{active_branch}",
+                active_branch,
+            ],
+            cwd=target_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        print("✅ Local remotes reconfigured successfully!")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Failed to reconfigure local remotes: {e}", file=sys.stderr)
+
+
 # ==============================================================================
 # CLI Entrypoint & Workflow
 # ==============================================================================
@@ -545,25 +731,21 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Skip cloning the repository locally after creation",
     )
+    parser.add_argument(
+        "--migrate",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="GITHUB_URL",
+        help="Migrate an existing GitHub repository to Gitea with automated push mirroring (URL or auto-detect from local origin)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """Main orchestration flow."""
     args = parse_args()
-    repo_name, target_dir, is_existing_git = determine_target(args.name)
     is_private: bool = not args.public
-
-    if not repo_name:
-        print("Error: Repository name cannot be determined.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"🚀 Initializing repository provisioning: '{repo_name}'")
-    print(f"   Visibility: {'Private' if is_private else 'Public'}")
-    if is_existing_git:
-        print(f"   Mode: Existing local repository at '{target_dir}'")
-    else:
-        print(f"   Mode: Greenfield creation at '{target_dir}'")
 
     # 1. Resolve Credentials
     creds = SecretProvider.resolve()
@@ -577,6 +759,108 @@ def main() -> None:
         token=creds.github_token,
     )
     gitea_host = creds.gitea_url.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
+
+    # --------------------------------------------------------------------------
+    # Migration Workflow (--migrate)
+    # --------------------------------------------------------------------------
+    if args.migrate is not None:
+        try:
+            migrated_name, gh_owner, gh_clone_url = parse_github_target(
+                args.migrate, Path.cwd()
+            )
+        except (ValueError, RuntimeError) as e:
+            print(f"❌ Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Allow explicit positional name to override destination repo name
+        if args.name and args.name.strip() and args.name.strip() != ".":
+            dest_name = args.name.strip()
+        else:
+            dest_name = migrated_name
+
+        print(
+            f"🚀 Initiating repository migration: '{gh_owner}/{migrated_name}' -> Gitea '{creds.gitea_user}/{dest_name}'"
+        )
+        print(f"   Visibility: {'Private' if is_private else 'Public'}")
+
+        # Fail-safe conflict check
+        if gitea_client.repo_exists(creds.gitea_user, dest_name):
+            print(
+                f"❌ Error: Repository '{dest_name}' already exists on Gitea under '{creds.gitea_user}'.\n"
+                f"   Inspect at: {creds.gitea_url}/{creds.gitea_user}/{dest_name}\n"
+                "   Aborting migration to prevent overwriting existing repositories.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Step 1: Server-side import via Gitea Migration API
+        print(
+            "🏗️  Importing full repository history from GitHub via Gitea Migration API..."
+        )
+        try:
+            res = gitea_client.migrate_repo(
+                clone_addr=gh_clone_url,
+                repo_name=dest_name,
+                github_token=creds.github_token,
+                private=is_private,
+                description=args.description,
+            )
+            gitea_html_url = res.get(
+                "html_url", f"{creds.gitea_url}/{creds.gitea_user}/{dest_name}"
+            )
+            print(f"✅ Gitea repository created from GitHub: {gitea_html_url}")
+        except RuntimeError as e:
+            print(f"❌ Migration failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Step 2: Register automated push mirror to GitHub
+        if not args.no_mirror:
+            print("🔗 Registering automated push mirror to GitHub...")
+            try:
+                gitea_client.create_push_mirror(
+                    repo_name=dest_name,
+                    remote_address=gh_clone_url,
+                    remote_username=creds.github_user,
+                    remote_password=creds.github_token,
+                    sync_on_commit=True,
+                    interval="8h",
+                )
+                print("✅ Gitea push mirror registered (sync on commit enabled)")
+            except RuntimeError as e:
+                print(f"⚠️  Push mirror registration failed: {e}", file=sys.stderr)
+
+        # Step 3: Reconfigure local working tree if inside a Git repository
+        gitea_clone_target = f"git@{gitea_host}:{creds.gitea_user}/{dest_name}.git"
+        if (Path.cwd() / ".git").is_dir():
+            reconfigure_local_remotes(Path.cwd(), gitea_clone_target)
+        elif not args.no_clone:
+            clone_locally(
+                gitea_host=gitea_host,
+                user=creds.gitea_user,
+                repo_name=dest_name,
+                target_dir=Path.cwd() / dest_name,
+            )
+
+        print("\n🎉 Migration complete!")
+        print(f"   Primary Forge (Gitea):  {gitea_html_url}")
+        print(f"   Backup Mirror (GitHub): {gh_clone_url}")
+        return
+
+    # --------------------------------------------------------------------------
+    # Standard Provisioning Workflow
+    # --------------------------------------------------------------------------
+    repo_name, target_dir, is_existing_git = determine_target(args.name)
+
+    if not repo_name:
+        print("Error: Repository name cannot be determined.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"🚀 Initializing repository provisioning: '{repo_name}'")
+    print(f"   Visibility: {'Private' if is_private else 'Public'}")
+    if is_existing_git:
+        print(f"   Mode: Existing local repository at '{target_dir}'")
+    else:
+        print(f"   Mode: Greenfield creation at '{target_dir}'")
 
     # 2. Provision Gitea Primary Repository
     gitea_html_url: str | None = None
