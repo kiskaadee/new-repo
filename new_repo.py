@@ -268,6 +268,60 @@ class GiteaClient:
         except urllib.error.URLError as e:
             raise RuntimeError(f"Gitea network error: {e.reason}") from e
 
+    def org_exists(self, org: str) -> bool:
+        """Check if an organization exists on Gitea."""
+        url = f"{self.base_url}/api/v1/orgs/{org}"
+        req = urllib.request.Request(
+            url=url,
+            headers={
+                "Authorization": f"token {self.token}",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            raw_err = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Gitea API error checking org '{org}' ({e.code} {e.reason}): {raw_err}"
+            ) from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Gitea network error: {e.reason}") from e
+
+    def create_org(
+        self,
+        org: str,
+        visibility: str = "private",
+    ) -> dict[str, Any]:
+        """Create a new organization on Gitea."""
+        payload: dict[str, Any] = {
+            "username": org,
+            "visibility": visibility,
+        }
+        return self._request("POST", "/api/v1/orgs", payload)
+
+    def ensure_org(self, org: str, private: bool = True) -> bool:
+        """Ensure a Gitea organization exists, creating it if missing.
+
+        Returns:
+            True if a new organization was created, False if it already existed.
+        """
+        if self.org_exists(org):
+            return False
+        visibility = "private" if private else "public"
+        try:
+            self.create_org(org, visibility=visibility)
+            return True
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Failed to create Gitea organization '{org}': {e}\n"
+                "Hint: Ensure your GITEA_TOKEN has 'write:organization' (or 'admin:org') permission scope."
+            ) from e
+
     def create_repo(
         self,
         name: str,
@@ -275,8 +329,9 @@ class GiteaClient:
         description: str = "",
         auto_init: bool = True,
         license_name: str = "UNLICENSE",
+        org: str | None = None,
     ) -> dict[str, Any]:
-        """Create a new repository under the authenticated user account."""
+        """Create a new repository under the authenticated user or specified organization."""
         payload: dict[str, Any] = {
             "name": name,
             "private": private,
@@ -287,7 +342,8 @@ class GiteaClient:
         if license_name:
             payload["license"] = license_name
 
-        return self._request("POST", "/api/v1/user/repos", payload)
+        endpoint = f"/api/v1/orgs/{org}/repos" if org else "/api/v1/user/repos"
+        return self._request("POST", endpoint, payload)
 
     def generate_from_template(
         self,
@@ -296,10 +352,11 @@ class GiteaClient:
         name: str,
         private: bool = True,
         description: str = "",
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Generate a new repository from an existing Gitea template repository."""
         payload = {
-            "owner": self.user,
+            "owner": owner or self.user,
             "name": name,
             "private": private,
             "description": description,
@@ -338,6 +395,7 @@ class GiteaClient:
         github_token: str,
         private: bool = True,
         description: str = "",
+        repo_owner: str | None = None,
     ) -> dict[str, Any]:
         """Import an existing GitHub repository server-side into Gitea.
 
@@ -348,7 +406,7 @@ class GiteaClient:
             "clone_addr": clone_addr,
             "auth_token": github_token,
             "repo_name": repo_name,
-            "repo_owner": self.user,
+            "repo_owner": repo_owner or self.user,
             "service": "github",
             "mirror": False,
             "private": private,
@@ -364,6 +422,7 @@ class GiteaClient:
         remote_password: str,
         sync_on_commit: bool = True,
         interval: str = "8h",
+        owner: str | None = None,
     ) -> dict[str, Any]:
         """Register a push mirror for a Gitea repository to an external Git target."""
         payload = {
@@ -373,7 +432,8 @@ class GiteaClient:
             "sync_on_commit": sync_on_commit,
             "interval": interval,
         }
-        path = f"/api/v1/repos/{self.user}/{repo_name}/push_mirrors"
+        target_owner = owner or self.user
+        path = f"/api/v1/repos/{target_owner}/{repo_name}/push_mirrors"
         return self._request("POST", path, payload)
 
 
@@ -390,6 +450,7 @@ class GitHubClient:
         name: str,
         private: bool = True,
         description: str = "",
+        org: str | None = None,
     ) -> dict[str, Any]:
         """Create an empty target repository on GitHub with auto_init=False.
 
@@ -403,9 +464,12 @@ class GitHubClient:
             "auto_init": False,
         }
         data = json.dumps(payload).encode("utf-8")
+        endpoint = (
+            f"{self.api_url}/orgs/{org}/repos" if org else f"{self.api_url}/user/repos"
+        )
 
         req = urllib.request.Request(
-            url=f"{self.api_url}/user/repos",
+            url=endpoint,
             data=data,
             headers={
                 "Authorization": f"Bearer {self.token}",
@@ -507,32 +571,68 @@ def link_and_push_existing(
         print(f"⚠️  Failed to link/push repository: {e}", file=sys.stderr)
 
 
-def determine_target(name_arg: str | None) -> tuple[str, Path, bool]:
-    """Determine (repo_name, target_dir, is_existing_git).
+def resolve_name_and_org(
+    name_arg: str | None,
+    org_arg: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Parse repository name and optional Gitea organization from CLI arguments.
+
+    Supports both explicit `--org <org>` and positional `org/repo` shorthand.
+
+    Raises:
+        ValueError: If `name_arg` has an invalid slash format or conflicts with `org_arg`.
+    """
+    explicit_org = org_arg.strip() if org_arg and org_arg.strip() else None
+
+    if not name_arg or name_arg.strip() == ".":
+        return None, explicit_org
+
+    raw_name = name_arg.strip()
+    if "/" in raw_name:
+        parts = [p.strip() for p in raw_name.split("/") if p.strip()]
+        if len(parts) != 2 or raw_name.startswith("/") or raw_name.endswith("/"):
+            raise ValueError(
+                f"Invalid repository target '{raw_name}'. Expected '<repo>' or '<org>/<repo>'."
+            )
+        shorthand_org, repo_name = parts[0], parts[1]
+        if explicit_org and explicit_org != shorthand_org:
+            raise ValueError(
+                f"Conflicting organizations specified: positional '{shorthand_org}' vs --org '{explicit_org}'."
+            )
+        return repo_name, shorthand_org
+
+    return raw_name, explicit_org
+
+
+def determine_target(
+    name_arg: str | None,
+    org_arg: str | None = None,
+    cwd: Path | None = None,
+) -> tuple[str, Path, bool, str | None]:
+    """Determine (repo_name, target_dir, is_existing_git, target_org).
 
     Returns:
         repo_name: The clean repository name for Gitea and GitHub.
-        target_dir: The directory on disk.
+        target_dir: The flat directory path on disk.
         is_existing_git: True if target_dir is an existing git repository.
+        target_org: The resolved Gitea organization name, or None for personal user.
     """
-    cwd = Path.cwd()
-    if not name_arg or name_arg.strip() == ".":
-        repo_name = cwd.name
-        target_dir = cwd
+    base_dir = cwd if cwd is not None else Path.cwd()
+    parsed_name, target_org = resolve_name_and_org(name_arg, org_arg)
+
+    if not parsed_name:
+        repo_name = base_dir.name
+        target_dir = base_dir
     else:
-        name_clean = name_arg.strip()
-        if name_clean == cwd.name:
-            repo_name = name_clean
-            target_dir = cwd
-        elif (cwd / name_clean).is_dir():
-            repo_name = name_clean
-            target_dir = cwd / name_clean
+        if parsed_name == base_dir.name:
+            repo_name = parsed_name
+            target_dir = base_dir
         else:
-            repo_name = name_clean
-            target_dir = cwd / name_clean
+            repo_name = parsed_name
+            target_dir = base_dir / parsed_name
 
     is_existing_git = (target_dir / ".git").is_dir()
-    return repo_name, target_dir, is_existing_git
+    return repo_name, target_dir, is_existing_git, target_org
 
 
 def parse_github_target(target_str: str | None, cwd: Path) -> tuple[str, str, str]:
@@ -688,7 +788,20 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         default=None,
         type=str,
-        help="Name of the repository to create (defaults to current directory if omitted or '.')",
+        help="Name of the repository to create ('[org/]repo', defaults to current directory if omitted or '.')",
+    )
+    parser.add_argument(
+        "-o",
+        "--org",
+        type=str,
+        default=None,
+        help="Target Gitea organization to own the repository (auto-created if missing)",
+    )
+    parser.add_argument(
+        "--github-org",
+        type=str,
+        default=None,
+        help="Optional GitHub organization for the offsite backup mirror (defaults to personal GITHUB_USER)",
     )
     parser.add_argument(
         "-p",
@@ -768,26 +881,33 @@ def main() -> None:
             migrated_name, gh_owner, gh_clone_url = parse_github_target(
                 args.migrate, Path.cwd()
             )
+            override_name, target_org = resolve_name_and_org(args.name, args.org)
         except (ValueError, RuntimeError) as e:
             print(f"❌ Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-        # Allow explicit positional name to override destination repo name
-        if args.name and args.name.strip() and args.name.strip() != ".":
-            dest_name = args.name.strip()
-        else:
-            dest_name = migrated_name
+        dest_name = override_name or migrated_name
+        gitea_owner = target_org or creds.gitea_user
 
         print(
-            f"🚀 Initiating repository migration: '{gh_owner}/{migrated_name}' -> Gitea '{creds.gitea_user}/{dest_name}'"
+            f"🚀 Initiating repository migration: '{gh_owner}/{migrated_name}' -> Gitea '{gitea_owner}/{dest_name}'"
         )
         print(f"   Visibility: {'Private' if is_private else 'Public'}")
 
+        if target_org:
+            try:
+                created_org = gitea_client.ensure_org(target_org, private=is_private)
+                if created_org:
+                    print(f"🏢 Created new Gitea organization '{target_org}'")
+            except RuntimeError as e:
+                print(f"❌ Error: {e}", file=sys.stderr)
+                sys.exit(1)
+
         # Fail-safe conflict check
-        if gitea_client.repo_exists(creds.gitea_user, dest_name):
+        if gitea_client.repo_exists(gitea_owner, dest_name):
             print(
-                f"❌ Error: Repository '{dest_name}' already exists on Gitea under '{creds.gitea_user}'.\n"
-                f"   Inspect at: {creds.gitea_url}/{creds.gitea_user}/{dest_name}\n"
+                f"❌ Error: Repository '{dest_name}' already exists on Gitea under '{gitea_owner}'.\n"
+                f"   Inspect at: {creds.gitea_url}/{gitea_owner}/{dest_name}\n"
                 "   Aborting migration to prevent overwriting existing repositories.",
                 file=sys.stderr,
             )
@@ -804,9 +924,10 @@ def main() -> None:
                 github_token=creds.github_token,
                 private=is_private,
                 description=args.description,
+                repo_owner=gitea_owner,
             )
             gitea_html_url = res.get(
-                "html_url", f"{creds.gitea_url}/{creds.gitea_user}/{dest_name}"
+                "html_url", f"{creds.gitea_url}/{gitea_owner}/{dest_name}"
             )
             print(f"✅ Gitea repository created from GitHub: {gitea_html_url}")
         except RuntimeError as e:
@@ -824,19 +945,20 @@ def main() -> None:
                     remote_password=creds.github_token,
                     sync_on_commit=True,
                     interval="8h",
+                    owner=gitea_owner,
                 )
                 print("✅ Gitea push mirror registered (sync on commit enabled)")
             except RuntimeError as e:
                 print(f"⚠️  Push mirror registration failed: {e}", file=sys.stderr)
 
         # Step 3: Reconfigure local working tree if inside a Git repository
-        gitea_clone_target = f"git@{gitea_host}:{creds.gitea_user}/{dest_name}.git"
+        gitea_clone_target = f"git@{gitea_host}:{gitea_owner}/{dest_name}.git"
         if (Path.cwd() / ".git").is_dir():
             reconfigure_local_remotes(Path.cwd(), gitea_clone_target)
         elif not args.no_clone:
             clone_locally(
                 gitea_host=gitea_host,
-                user=creds.gitea_user,
+                user=gitea_owner,
                 repo_name=dest_name,
                 target_dir=Path.cwd() / dest_name,
             )
@@ -849,13 +971,25 @@ def main() -> None:
     # --------------------------------------------------------------------------
     # Standard Provisioning Workflow
     # --------------------------------------------------------------------------
-    repo_name, target_dir, is_existing_git = determine_target(args.name)
+    try:
+        repo_name, target_dir, is_existing_git, target_org = determine_target(
+            args.name, args.org
+        )
+    except ValueError as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if not repo_name:
         print("Error: Repository name cannot be determined.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"🚀 Initializing repository provisioning: '{repo_name}'")
+    gitea_owner = target_org or creds.gitea_user
+    github_org = (
+        args.github_org.strip() if args.github_org and args.github_org.strip() else None
+    )
+    github_owner = github_org or creds.github_user
+
+    print(f"🚀 Initializing repository provisioning: '{gitea_owner}/{repo_name}'")
     print(f"   Visibility: {'Private' if is_private else 'Public'}")
     if is_existing_git:
         print(f"   Mode: Existing local repository at '{target_dir}'")
@@ -865,6 +999,11 @@ def main() -> None:
     # 2. Provision Gitea Primary Repository
     gitea_html_url: str | None = None
     try:
+        if target_org:
+            created_org = gitea_client.ensure_org(target_org, private=is_private)
+            if created_org:
+                print(f"🏢 Created new Gitea organization '{target_org}'")
+
         if is_existing_git:
             print(
                 "🏗️  Creating empty primary repository on Gitea (preserving local history)..."
@@ -875,13 +1014,14 @@ def main() -> None:
                 description=args.description,
                 auto_init=False,  # CRUCIAL: Do not create remote README/license to prevent divergent commit histories
                 license_name="",
+                org=target_org,
             )
         elif args.template:
             template_parts = args.template.split("/", 1)
             if len(template_parts) == 2:
                 tmpl_owner, tmpl_name = template_parts[0], template_parts[1]
             else:
-                tmpl_owner, tmpl_name = creds.gitea_user, template_parts[0]
+                tmpl_owner, tmpl_name = gitea_owner, template_parts[0]
 
             print(
                 f"🏗️  Generating Gitea repository from template '{tmpl_owner}/{tmpl_name}'..."
@@ -892,6 +1032,7 @@ def main() -> None:
                 name=repo_name,
                 private=is_private,
                 description=args.description,
+                owner=gitea_owner,
             )
         else:
             print("🏗️  Creating primary repository on Gitea...")
@@ -901,9 +1042,10 @@ def main() -> None:
                 description=args.description,
                 auto_init=True,
                 license_name=args.license,
+                org=target_org,
             )
         gitea_html_url = res.get(
-            "html_url", f"{creds.gitea_url}/{creds.gitea_user}/{repo_name}"
+            "html_url", f"{creds.gitea_url}/{gitea_owner}/{repo_name}"
         )
         print(f"✅ Gitea repository created: {gitea_html_url}")
     except RuntimeError as e:
@@ -919,16 +1061,15 @@ def main() -> None:
                 name=repo_name,
                 private=is_private,
                 description=args.description,
+                org=github_org,
             )
             github_html_url = gh_res.get(
-                "html_url", f"https://github.com/{creds.github_user}/{repo_name}"
+                "html_url", f"https://github.com/{github_owner}/{repo_name}"
             )
             print(f"✅ GitHub mirror target created: {github_html_url}")
 
             print("🔗 Registering automated push mirror on Gitea...")
-            github_clone_target = (
-                f"https://github.com/{creds.github_user}/{repo_name}.git"
-            )
+            github_clone_target = f"https://github.com/{github_owner}/{repo_name}.git"
             gitea_client.create_push_mirror(
                 repo_name=repo_name,
                 remote_address=github_clone_target,
@@ -936,6 +1077,7 @@ def main() -> None:
                 remote_password=creds.github_token,
                 sync_on_commit=True,
                 interval="8h",
+                owner=gitea_owner,
             )
             print("✅ Gitea push mirror registered (sync on commit enabled)")
         except RuntimeError as e:
@@ -951,14 +1093,14 @@ def main() -> None:
     if is_existing_git:
         link_and_push_existing(
             gitea_host=gitea_host,
-            user=creds.gitea_user,
+            user=gitea_owner,
             repo_name=repo_name,
             target_dir=target_dir,
         )
     elif not args.no_clone:
         clone_locally(
             gitea_host=gitea_host,
-            user=creds.gitea_user,
+            user=gitea_owner,
             repo_name=repo_name,
             target_dir=target_dir,
         )

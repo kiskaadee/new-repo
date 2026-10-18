@@ -7,12 +7,17 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from new_repo import (
+    GiteaClient,
+    GitHubClient,
     SecretProvider,
+    determine_target,
     parse_args,
     parse_github_target,
     reconfigure_local_remotes,
+    resolve_name_and_org,
 )
 
 
@@ -25,6 +30,8 @@ class TestArgParsing(unittest.TestCase):
         sys.argv = ["new-repo", "sample-project"]
         args = parse_args()
         self.assertEqual(args.name, "sample-project")
+        self.assertIsNone(args.org)
+        self.assertIsNone(args.github_org)
         self.assertFalse(args.public)
         self.assertEqual(args.license, "UNLICENSE")
         self.assertIsNone(args.template)
@@ -56,6 +63,10 @@ class TestArgParsing(unittest.TestCase):
         sys.argv = [
             "new-repo",
             "open-api",
+            "-o",
+            "homelab",
+            "--github-org",
+            "homelab-gh",
             "--public",
             "-d",
             "My public API",
@@ -68,6 +79,8 @@ class TestArgParsing(unittest.TestCase):
         ]
         args = parse_args()
         self.assertEqual(args.name, "open-api")
+        self.assertEqual(args.org, "homelab")
+        self.assertEqual(args.github_org, "homelab-gh")
         self.assertTrue(args.public)
         self.assertEqual(args.description, "My public API")
         self.assertEqual(args.license, "MIT")
@@ -75,6 +88,142 @@ class TestArgParsing(unittest.TestCase):
         self.assertTrue(args.no_mirror)
         self.assertTrue(args.no_clone)
         self.assertIsNone(args.migrate)
+
+
+class TestOrganizationAndTargetResolution(unittest.TestCase):
+    """Test resolution of repository names, org/repo shorthands, and flat local paths."""
+
+    def test_resolve_name_and_org_variants(self) -> None:
+        self.assertEqual(resolve_name_and_org("my-repo", None), ("my-repo", None))
+        self.assertEqual(
+            resolve_name_and_org("my-repo", "homelab"), ("my-repo", "homelab")
+        )
+        self.assertEqual(
+            resolve_name_and_org("homelab/my-repo", None), ("my-repo", "homelab")
+        )
+        self.assertEqual(
+            resolve_name_and_org("homelab/my-repo", "homelab"), ("my-repo", "homelab")
+        )
+        self.assertEqual(resolve_name_and_org(None, "homelab"), (None, "homelab"))
+        self.assertEqual(resolve_name_and_org(".", "homelab"), (None, "homelab"))
+
+    def test_resolve_name_and_org_conflicts_and_invalid(self) -> None:
+        with self.assertRaises(ValueError):
+            resolve_name_and_org("org1/my-repo", "org2")
+        with self.assertRaises(ValueError):
+            resolve_name_and_org("a/b/c", None)
+        with self.assertRaises(ValueError):
+            resolve_name_and_org("/leading-slash", None)
+        with self.assertRaises(ValueError):
+            resolve_name_and_org("trailing-slash/", None)
+
+    def test_determine_target_flat_directory_for_org_shorthand(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir)
+            repo_name, target_dir, is_existing_git, target_org = determine_target(
+                "homelab/core", None, cwd=cwd
+            )
+            self.assertEqual(repo_name, "core")
+            self.assertEqual(target_dir, cwd / "core")
+            self.assertFalse(is_existing_git)
+            self.assertEqual(target_org, "homelab")
+
+    def test_determine_target_inside_matching_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "core"
+            repo_dir.mkdir()
+            (repo_dir / ".git").mkdir()
+            repo_name, target_dir, is_existing_git, target_org = determine_target(
+                "homelab/core", None, cwd=repo_dir
+            )
+            self.assertEqual(repo_name, "core")
+            self.assertEqual(target_dir, repo_dir)
+            self.assertTrue(is_existing_git)
+            self.assertEqual(target_org, "homelab")
+
+
+class TestApiClientOrganizationRouting(unittest.TestCase):
+    """Test GiteaClient and GitHubClient organization endpoint routing."""
+
+    def test_gitea_create_repo_personal_vs_org(self) -> None:
+        client = GiteaClient("https://gitea.local", "kiskaadee", "secret-token")
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.create_repo("personal-repo")
+            mock_req.assert_called_once()
+            self.assertEqual(mock_req.call_args[0][1], "/api/v1/user/repos")
+
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.create_repo("org-repo", org="homelab")
+            mock_req.assert_called_once()
+            self.assertEqual(mock_req.call_args[0][1], "/api/v1/orgs/homelab/repos")
+
+    def test_gitea_ensure_org_creates_when_missing(self) -> None:
+        client = GiteaClient("https://gitea.local", "kiskaadee", "secret-token")
+        with (
+            patch.object(client, "org_exists", return_value=False) as mock_exists,
+            patch.object(client, "create_org", return_value={}) as mock_create,
+        ):
+            created = client.ensure_org("homelab", private=True)
+            self.assertTrue(created)
+            mock_exists.assert_called_once_with("homelab")
+            mock_create.assert_called_once_with("homelab", visibility="private")
+
+    def test_gitea_ensure_org_skips_when_existing(self) -> None:
+        client = GiteaClient("https://gitea.local", "kiskaadee", "secret-token")
+        with (
+            patch.object(client, "org_exists", return_value=True) as mock_exists,
+            patch.object(client, "create_org", return_value={}) as mock_create,
+        ):
+            created = client.ensure_org("homelab", private=True)
+            self.assertFalse(created)
+            mock_exists.assert_called_once_with("homelab")
+            mock_create.assert_not_called()
+
+    def test_gitea_push_mirror_and_template_and_migrate_owner(self) -> None:
+        client = GiteaClient("https://gitea.local", "kiskaadee", "secret-token")
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.create_push_mirror(
+                "core",
+                "https://github.com/kiskaadee/core.git",
+                "kiskaadee",
+                "gh-token",
+                owner="homelab",
+            )
+            self.assertEqual(
+                mock_req.call_args[0][1], "/api/v1/repos/homelab/core/push_mirrors"
+            )
+
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.generate_from_template(
+                "homelab", "tmpl", "new-service", owner="homelab"
+            )
+            self.assertEqual(mock_req.call_args[0][2]["owner"], "homelab")
+
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.migrate_repo(
+                "https://github.com/kiskaadee/core.git",
+                "core",
+                "gh-token",
+                repo_owner="homelab",
+            )
+            self.assertEqual(mock_req.call_args[0][2]["repo_owner"], "homelab")
+
+    def test_github_create_empty_repo_personal_vs_org(self) -> None:
+        gh_client = GitHubClient("kiskaadee", "gh-token")
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"{}"
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+            gh_client.create_empty_repo("core")
+            req_personal = mock_urlopen.call_args[0][0]
+            self.assertEqual(req_personal.full_url, "https://api.github.com/user/repos")
+
+            gh_client.create_empty_repo("core", org="homelab-gh")
+            req_org = mock_urlopen.call_args[0][0]
+            self.assertEqual(
+                req_org.full_url, "https://api.github.com/orgs/homelab-gh/repos"
+            )
 
 
 class TestDotenvLoader(unittest.TestCase):
