@@ -22,6 +22,7 @@ Architecture Decision Records (ADRs) are maintained in [`docs/adr/`](docs/adr/):
 - [**ADR 003**: Dual-Forge Topology with Automated Push Mirroring and Retain-and-Report Error Policy](docs/adr/0003-dual-forge-topology-with-automated-push-mirroring.md)
 - [**ADR 004**: Existing Repository Linking and Auto-Detection](docs/adr/0004-existing-repository-linking-and-auto-detection.md)
 - [**ADR 005**: GitHub-to-Gitea Migration with Automated Push Mirroring](docs/adr/0005-github-to-gitea-migration-with-automated-push-mirroring.md)
+- [**ADR 006**: Gitea Organization Binding and Auto-Provisioning](docs/adr/0006-gitea-organization-binding.md)
 
 ---
 
@@ -31,9 +32,11 @@ Architecture Decision Records (ADRs) are maintained in [`docs/adr/`](docs/adr/):
 Usage: new-repo [NAME] [OPTIONS]
 
 Arguments:
-  name                  Optional repository name (defaults to current directory if omitted or '.')
+  name                  Optional repository name ('[org/]repo', defaults to current directory if omitted or '.')
 
 Options:
+  -o, --org ORG         Target Gitea organization to own the repository (auto-created if missing)
+  --github-org ORG      Optional GitHub organization for the offsite backup mirror (defaults to personal GITHUB_USER)
   --migrate [URL]       Migrate an existing GitHub repo to Gitea with automated push mirroring (URL or auto-detect from local origin)
   -p, --public          Make repository public (default: private)
   -d, --description     Optional repository description string
@@ -50,23 +53,28 @@ Options:
 # 1. Standard greenfield creation (Private Gitea + GitHub push mirror + UNLICENSE + auto-clone)
 new-repo service-api
 
-# 2. Attach remotes & push an existing local repository
-cd ~/Projects/my-existing-app
-new-repo
+# 2. Provision under a Gitea organization (via shorthand or -o/--org flag; auto-creates org if missing)
+new-repo homelab/core
+new-repo core -o homelab
 
-# 3. Provision from an existing Gitea template
+# 3. Attach remotes & push an existing local repository (into personal account or organization)
+cd ~/Projects/my-existing-app
+new-repo -o homelab
+
+# 4. Provision from an existing Gitea template
 new-repo web-client --template template-react-app
 
-# 4. Local-only repository (no GitHub mirror)
+# 5. Local-only repository (no GitHub mirror)
 new-repo private-notes --no-mirror
 
-# 5. Public open-source repository with MIT license
+# 6. Public open-source repository with MIT license
 new-repo utility-lib --public --license MIT
 
-# 6. Migrate an existing GitHub repository to Gitea with push mirror
+# 7. Migrate an existing GitHub repository to Gitea (personal or organization) with push mirror
 new-repo --migrate https://github.com/my-org/existing-service
+new-repo homelab/existing-service --migrate https://github.com/my-org/existing-service
 
-# 7. Migrate repository in-place from inside a local checkout
+# 8. Migrate repository in-place from inside a local checkout
 cd ~/Projects/existing-service
 new-repo --migrate
 ```
