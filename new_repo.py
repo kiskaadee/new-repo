@@ -304,7 +304,7 @@ class GiteaClient:
         }
         return self._request("POST", "/api/v1/orgs", payload)
 
-    def ensure_org(self, org: str, private: bool = True) -> bool:
+    def ensure_org(self, org: str, private: bool = False) -> bool:
         """Ensure a Gitea organization exists, creating it if missing.
 
         Returns:
@@ -325,7 +325,7 @@ class GiteaClient:
     def create_repo(
         self,
         name: str,
-        private: bool = True,
+        private: bool = False,
         description: str = "",
         auto_init: bool = True,
         license_name: str = "UNLICENSE",
@@ -350,7 +350,7 @@ class GiteaClient:
         template_owner: str,
         template_name: str,
         name: str,
-        private: bool = True,
+        private: bool = False,
         description: str = "",
         owner: str | None = None,
     ) -> dict[str, Any]:
@@ -393,7 +393,7 @@ class GiteaClient:
         clone_addr: str,
         repo_name: str,
         github_token: str,
-        private: bool = True,
+        private: bool = False,
         description: str = "",
         repo_owner: str | None = None,
     ) -> dict[str, Any]:
@@ -448,7 +448,7 @@ class GitHubClient:
     def create_empty_repo(
         self,
         name: str,
-        private: bool = True,
+        private: bool = False,
         description: str = "",
         org: str | None = None,
     ) -> dict[str, Any]:
@@ -805,10 +805,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-p",
-        "--public",
+        "--private",
         action="store_true",
         default=False,
-        help="Make repository public (default: private)",
+        help="Make repository private (default: public)",
     )
     parser.add_argument(
         "-d",
@@ -858,7 +858,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Main orchestration flow."""
     args = parse_args()
-    is_private: bool = not args.public
+    is_private: bool = args.private
 
     # 1. Resolve Credentials
     creds = SecretProvider.resolve()

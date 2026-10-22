@@ -32,7 +32,7 @@ class TestArgParsing(unittest.TestCase):
         self.assertEqual(args.name, "sample-project")
         self.assertIsNone(args.org)
         self.assertIsNone(args.github_org)
-        self.assertFalse(args.public)
+        self.assertFalse(args.private)
         self.assertEqual(args.license, "UNLICENSE")
         self.assertIsNone(args.template)
         self.assertFalse(args.no_mirror)
@@ -67,7 +67,7 @@ class TestArgParsing(unittest.TestCase):
             "homelab",
             "--github-org",
             "homelab-gh",
-            "--public",
+            "--private",
             "-d",
             "My public API",
             "-l",
@@ -81,7 +81,7 @@ class TestArgParsing(unittest.TestCase):
         self.assertEqual(args.name, "open-api")
         self.assertEqual(args.org, "homelab")
         self.assertEqual(args.github_org, "homelab-gh")
-        self.assertTrue(args.public)
+        self.assertTrue(args.private)
         self.assertEqual(args.description, "My public API")
         self.assertEqual(args.license, "MIT")
         self.assertEqual(args.template, "template-fastapi")

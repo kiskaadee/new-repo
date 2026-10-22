@@ -38,7 +38,7 @@ Options:
   -o, --org ORG         Target Gitea organization to own the repository (auto-created if missing)
   --github-org ORG      Optional GitHub organization for the offsite backup mirror (defaults to personal GITHUB_USER)
   --migrate [URL]       Migrate an existing GitHub repo to Gitea with automated push mirroring (URL or auto-detect from local origin)
-  -p, --public          Make repository public (default: private)
+  -p, --private         Make repository private (default: public)
   -d, --description     Optional repository description string
   -l, --license         License template identifier (default: UNLICENSE, pass "" to disable)
   -t, --template        Optional Gitea template repository ('[owner/]template-name')
@@ -50,7 +50,7 @@ Options:
 ### Examples
 
 ```bash
-# 1. Standard greenfield creation (Private Gitea + GitHub push mirror + UNLICENSE + auto-clone)
+# 1. Standard greenfield creation (Public Gitea + GitHub push mirror + UNLICENSE + auto-clone)
 new-repo service-api
 
 # 2. Provision under a Gitea organization (via shorthand or -o/--org flag; auto-creates org if missing)
@@ -67,8 +67,8 @@ new-repo web-client --template template-react-app
 # 5. Local-only repository (no GitHub mirror)
 new-repo private-notes --no-mirror
 
-# 6. Public open-source repository with MIT license
-new-repo utility-lib --public --license MIT
+# 6. Private repository with MIT license
+new-repo utility-lib --private --license MIT
 
 # 7. Migrate an existing GitHub repository to Gitea (personal or organization) with push mirror
 new-repo --migrate https://github.com/my-org/existing-service

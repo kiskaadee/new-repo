@@ -17,7 +17,7 @@ We extend `new-repo` to support binding repositories to a Gitea organization acr
 
 2. **Automatic Organization Provisioning on Gitea**:
    - Before provisioning or migrating a repository under a target organization, `new-repo` checks whether the organization exists via `GET /api/v1/orgs/{org}`.
-   - If the organization returns `404 Not Found`, `new-repo` automatically provisions it via `POST /api/v1/orgs` with visibility matching the repository's privacy flag (`private` by default, or `public` when `--public` is passed).
+   - If the organization returns `404 Not Found`, `new-repo` automatically provisions it via `POST /api/v1/orgs` with visibility matching the repository's privacy flag (`public` by default, or `private` when `--private` is passed).
 
 3. **Endpoint Routing Across Workflows**:
    - **Standard & Existing Git Creation**: Routes to `POST /api/v1/orgs/{org}/repos` when an organization is specified, or `POST /api/v1/user/repos` otherwise.
