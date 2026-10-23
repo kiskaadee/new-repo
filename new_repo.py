@@ -42,6 +42,7 @@ class Credentials:
         gitea_token: Gitea Personal Access Token with repository read/write permissions.
         github_user: GitHub username owning the offsite backup mirror repository.
         github_token: GitHub Personal Access Token with repository creation permissions.
+        ssh_key: Optional path to dedicated SSH identity file for git operations.
     """
 
     gitea_url: str
@@ -49,6 +50,7 @@ class Credentials:
     gitea_token: str
     github_user: str
     github_token: str
+    ssh_key: str | None = None
 
 
 class SecretProvider:
@@ -112,37 +114,101 @@ class SecretProvider:
         return None
 
     @staticmethod
-    def _extract_tea_login() -> tuple[str | None, str | None, str | None]:
-        """Extract Gitea credentials from ~/.config/tea/config.yml if the tea CLI is configured.
-
-        Returns:
-            A tuple of (token, url, user), or None for missing values.
-        """
-        tea_cfg = Path.home() / ".config" / "tea" / "config.yml"
+    def _parse_tea_logins(tea_cfg: Path) -> list[dict[str, Any]]:
+        """Parse ~/.config/tea/config.yml into discrete login dictionaries."""
         if not tea_cfg.is_file():
-            return None, None, None
-
-        token: str | None = None
-        url: str | None = None
-        user: str | None = None
-
+            return []
+        logins: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        in_logins = False
         try:
             with open(tea_cfg, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("token:"):
-                        token = line.split(":", 1)[1].strip().strip("\"'")
-                    elif line.startswith("url:"):
-                        url = line.split(":", 1)[1].strip().strip("\"'")
-                    elif line.startswith("user:"):
-                        user = line.split(":", 1)[1].strip().strip("\"'")
-            return token, url, user
+                for raw_line in f:
+                    stripped = raw_line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if stripped == "logins:":
+                        in_logins = True
+                        continue
+                    if in_logins and not raw_line.startswith((" ", "\t", "-")):
+                        break
+                    if not in_logins:
+                        continue
+
+                    if stripped.startswith("- "):
+                        if current is not None:
+                            logins.append(current)
+                        current = {}
+                        rest = stripped[2:].strip()
+                        if ":" in rest:
+                            k, v = rest.split(":", 1)
+                            val = v.strip().strip("'\"")
+                            current[k.strip()] = True if val.lower() == "true" else False if val.lower() == "false" else val
+                    elif current is not None and ":" in stripped:
+                        k, v = stripped.split(":", 1)
+                        val = v.strip().strip("'\"")
+                        current[k.strip()] = True if val.lower() == "true" else False if val.lower() == "false" else val
+                if current is not None:
+                    logins.append(current)
         except OSError:
-            return None, None, None
+            return []
+        return logins
 
     @classmethod
-    def resolve(cls) -> Credentials:
+    def _extract_tea_login(
+        cls, target_persona: str | None = None
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Extract Gitea credentials from ~/.config/tea/config.yml for a target persona or default.
+
+        Returns:
+            A tuple of (token, url, user, ssh_key), or (None, None, None, None).
+        """
+        tea_cfg = Path.home() / ".config" / "tea" / "config.yml"
+        logins = cls._parse_tea_logins(tea_cfg)
+        if not logins:
+            return None, None, None, None
+
+        selected: dict[str, Any] | None = None
+        if target_persona:
+            target_norm = target_persona.strip().lower()
+            for entry in logins:
+                name = str(entry.get("name", "")).strip().lower()
+                user = str(entry.get("user", "")).strip().lower()
+                if target_norm in (name, user):
+                    selected = entry
+                    break
+            if not selected:
+                available = ", ".join(str(e.get("name", "")) for e in logins)
+                print(
+                    f"❌ Error: Persona / login '{target_persona}' not found in tea configuration ({tea_cfg}).\n"
+                    f"   Available tea logins: {available}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            for entry in logins:
+                if entry.get("default") is True:
+                    selected = entry
+                    break
+            if not selected and logins:
+                selected = logins[0]
+
+        if not selected:
+            return None, None, None, None
+
+        return (
+            selected.get("token"),
+            selected.get("url"),
+            selected.get("user") or selected.get("name"),
+            selected.get("ssh_key"),
+        )
+
+    @classmethod
+    def resolve(cls, as_persona: str | None = None) -> Credentials:
         """Resolve all necessary credentials following the multi-tier hierarchy.
+
+        Args:
+            as_persona: Optional persona/login name (e.g. 'anneux').
 
         Raises:
             SystemExit: If Gitea or GitHub tokens cannot be resolved from any source.
@@ -152,6 +218,8 @@ class SecretProvider:
 
         def get_val(key: str) -> str | None:
             return os.environ.get(key) or dotenv.get(key)
+
+        persona = as_persona or get_val("NEW_REPO_AS") or get_val("TEA_LOGIN")
 
         secrets_file_env = os.environ.get("SECRETS_FILE")
         config_secrets = (
@@ -165,20 +233,52 @@ class SecretProvider:
             else Path.home() / "Homelab" / "Core" / "nixos" / "secrets.yaml"
         )
 
-        # 1. Gitea resolution
-        tea_token, tea_url, tea_user = cls._extract_tea_login()
+        tea_token, tea_url, tea_user, tea_ssh_key = cls._extract_tea_login(target_persona=persona)
+
+        persona_sops: Path | None = None
+        if persona:
+            candidates = [
+                Path.home() / "Config" / f"{persona}-secrets.yaml",
+                Path.home() / "Config" / f"{persona.rstrip('ux')}-secrets.yaml",
+            ]
+            for c in candidates:
+                if c.is_file():
+                    persona_sops = c
+                    break
 
         gitea_url = get_val("GITEA_URL") or tea_url or "https://gitea.roadtotech.me"
-        gitea_user = get_val("GITEA_USER") or tea_user or "kiskaadee"
-        gitea_token = (
-            get_val("GITEA_TOKEN")
-            or cls._extract_sops_key(["gitea", "api_token"], config_secrets)
-            or tea_token
-        )
+
+        if persona:
+            gitea_user = get_val("GITEA_USER") or tea_user or persona
+            gitea_token = (
+                get_val("GITEA_TOKEN")
+                or (cls._extract_sops_key(["gitea", "token"], persona_sops) if persona_sops else None)
+                or (cls._extract_sops_key(["gitea", "api_token"], persona_sops) if persona_sops else None)
+                or tea_token
+            )
+            github_user = get_val("GITHUB_USER") or persona
+            github_token = (
+                get_val("GITHUB_TOKEN")
+                or (cls._extract_sops_key(["github", "token"], persona_sops) if persona_sops else None)
+                or cls._extract_sops_key(["system", "gh_repo_token"], config_secrets)
+            )
+        else:
+            gitea_user = get_val("GITEA_USER") or tea_user or "kiskaadee"
+            gitea_token = (
+                get_val("GITEA_TOKEN")
+                or cls._extract_sops_key(["gitea", "api_token"], config_secrets)
+                or tea_token
+            )
+            github_user = get_val("GITHUB_USER") or "kiskaadee"
+            github_token = (
+                get_val("GITHUB_TOKEN")
+                or cls._extract_sops_key(["system", "gh_repo_token"], config_secrets)
+                or cls._extract_sops_key(["system", "gh_repo_token"], homelab_secrets)
+            )
 
         if not gitea_token:
             print(
-                "Error: Unable to resolve Gitea API token.\n"
+                f"Error: Unable to resolve Gitea API token for persona '{gitea_user}'.\n"
                 "To provide credentials, either:\n"
                 "  1. Export GITEA_TOKEN in your environment (or define in a .env file)\n"
                 "  2. Add 'gitea.api_token' to ~/Config/secrets.yaml via SOPS\n"
@@ -189,17 +289,9 @@ class SecretProvider:
             )
             sys.exit(1)
 
-        # 2. GitHub resolution
-        github_user = get_val("GITHUB_USER") or "kiskaadee"
-        github_token = (
-            get_val("GITHUB_TOKEN")
-            or cls._extract_sops_key(["system", "gh_repo_token"], config_secrets)
-            or cls._extract_sops_key(["system", "gh_repo_token"], homelab_secrets)
-        )
-
         if not github_token:
             print(
-                "Error: Unable to resolve GitHub API token.\n"
+                f"Error: Unable to resolve GitHub API token for persona '{github_user}'.\n"
                 "To provide credentials, either:\n"
                 "  1. Export GITHUB_TOKEN in your environment (or define in a .env file)\n"
                 "  2. Add 'system.gh_repo_token' to ~/Config/secrets.yaml via SOPS\n",
@@ -213,6 +305,7 @@ class SecretProvider:
             gitea_token=gitea_token,
             github_user=github_user,
             github_token=github_token,
+            ssh_key=tea_ssh_key,
         )
 
 
@@ -317,6 +410,14 @@ class GiteaClient:
             raise RuntimeError(f"Gitea API error ({e.code} {e.reason}): {msg}") from e
         except urllib.error.URLError as e:
             raise RuntimeError(f"Gitea network error: {e.reason}") from e
+
+    def get_authenticated_user(self) -> str:
+        """Return the authenticated username associated with the token."""
+        try:
+            res = self._request("GET", "/api/v1/user")
+            return res.get("username") or res.get("login") or ""
+        except Exception:
+            return ""
 
     def org_exists(self, org: str) -> bool:
         """Check if an organization exists on Gitea."""
@@ -552,20 +653,31 @@ class GitHubClient:
 # ==============================================================================
 
 
-def clone_locally(gitea_host: str, user: str, repo_name: str, target_dir: Path) -> None:
+def clone_locally(
+    gitea_host: str,
+    user: str,
+    repo_name: str,
+    target_dir: Path,
+    clone_url: str | None = None,
+    ssh_key: str | None = None,
+) -> None:
     """Clones the newly created repository into the target directory."""
     if target_dir.exists():
         print(f"⚠️  Target directory '{target_dir}' already exists. Skipping clone.")
         return
 
-    clone_url = f"git@{gitea_host}:{user}/{repo_name}.git"
+    final_clone_url = clone_url or f"git@{gitea_host}:{user}/{repo_name}.git"
     print(f"📦 Cloning repository locally into '{target_dir.name}'...")
+    env = os.environ.copy()
+    if ssh_key and Path(ssh_key).is_file():
+        env["GIT_SSH_COMMAND"] = f"ssh -i {ssh_key} -o IdentitiesOnly=yes"
     try:
         subprocess.run(
-            ["git", "clone", clone_url, str(target_dir)],
+            ["git", "clone", final_clone_url, str(target_dir)],
             check=True,
             capture_output=True,
             text=True,
+            env=env,
         )
         print(f"✅ Cloned successfully to {target_dir}")
     except subprocess.CalledProcessError as e:
@@ -573,11 +685,19 @@ def clone_locally(gitea_host: str, user: str, repo_name: str, target_dir: Path) 
 
 
 def link_and_push_existing(
-    gitea_host: str, user: str, repo_name: str, target_dir: Path
+    gitea_host: str,
+    user: str,
+    repo_name: str,
+    target_dir: Path,
+    clone_url: str | None = None,
+    ssh_key: str | None = None,
 ) -> None:
     """Links an existing local git repository to the new Gitea remote and pushes commits."""
-    clone_url = f"git@{gitea_host}:{user}/{repo_name}.git"
-    print(f"🔗 Setting remote 'origin' to {clone_url}...")
+    final_clone_url = clone_url or f"git@{gitea_host}:{user}/{repo_name}.git"
+    print(f"🔗 Setting remote 'origin' to {final_clone_url}...")
+    env = os.environ.copy()
+    if ssh_key and Path(ssh_key).is_file():
+        env["GIT_SSH_COMMAND"] = f"ssh -i {ssh_key} -o IdentitiesOnly=yes"
     try:
         remotes_out = subprocess.run(
             ["git", "remote"],
@@ -589,14 +709,14 @@ def link_and_push_existing(
         remotes = remotes_out.stdout.split()
         if "origin" in remotes:
             subprocess.run(
-                ["git", "remote", "set-url", "origin", clone_url],
+                ["git", "remote", "set-url", "origin", final_clone_url],
                 cwd=target_dir,
                 check=True,
             )
             print("   Updated existing 'origin' remote URL.")
         else:
             subprocess.run(
-                ["git", "remote", "add", "origin", clone_url],
+                ["git", "remote", "add", "origin", final_clone_url],
                 cwd=target_dir,
                 check=True,
             )
@@ -616,6 +736,7 @@ def link_and_push_existing(
             ["git", "push", "-u", "origin", current_branch],
             cwd=target_dir,
             check=True,
+            env=env,
         )
         print(f"✅ Successfully pushed '{current_branch}' to Gitea!")
     except subprocess.CalledProcessError as e:
@@ -896,6 +1017,13 @@ def parse_args() -> argparse.Namespace:
         help="Skip cloning the repository locally after creation",
     )
     parser.add_argument(
+        "--as",
+        dest="as_persona",
+        type=str,
+        default=None,
+        help="Persona / login identity to provision as (matches tea login name or SOPS persona, e.g. anneux)",
+    )
+    parser.add_argument(
         "--migrate",
         nargs="?",
         const="",
@@ -912,7 +1040,7 @@ def main() -> None:
     is_private: bool = args.private
 
     # 1. Resolve Credentials
-    creds = SecretProvider.resolve()
+    creds = SecretProvider.resolve(as_persona=args.as_persona)
     gitea_client = GiteaClient(
         base_url=creds.gitea_url,
         user=creds.gitea_user,
@@ -939,6 +1067,17 @@ def main() -> None:
 
         dest_name = override_name or migrated_name
         gitea_owner = target_org or creds.gitea_user
+
+        # Align with token authenticated user if targeting user namespace
+        if not target_org:
+            auth_user = gitea_client.get_authenticated_user()
+            if auth_user and auth_user.lower() != gitea_owner.lower():
+                print(
+                    f"⚠️  Identity Warning: Gitea token belongs to '{auth_user}', but session persona is '{gitea_owner}'.\n"
+                    f"   Aligning primary owner to token owner '{auth_user}'.",
+                    file=sys.stderr,
+                )
+                gitea_owner = auth_user
 
         print(
             f"🚀 Initiating repository migration: '{gh_owner}/{migrated_name}' -> Gitea '{gitea_owner}/{dest_name}'"
@@ -977,8 +1116,9 @@ def main() -> None:
                 description=args.description,
                 repo_owner=gitea_owner,
             )
+            actual_owner = res.get("owner", {}).get("username") or gitea_owner
             gitea_html_url = res.get(
-                "html_url", f"{creds.gitea_url}/{gitea_owner}/{dest_name}"
+                "html_url", f"{creds.gitea_url}/{actual_owner}/{dest_name}"
             )
             print(f"✅ Gitea repository created from GitHub: {gitea_html_url}")
         except RuntimeError as e:
@@ -996,22 +1136,24 @@ def main() -> None:
                     remote_password=creds.github_token,
                     sync_on_commit=True,
                     interval="8h",
-                    owner=gitea_owner,
+                    owner=actual_owner,
                 )
                 print("✅ Gitea push mirror registered (sync on commit enabled)")
             except RuntimeError as e:
                 print(f"⚠️  Push mirror registration failed: {e}", file=sys.stderr)
 
         # Step 3: Reconfigure local working tree if inside a Git repository
-        gitea_clone_target = f"git@{gitea_host}:{gitea_owner}/{dest_name}.git"
+        gitea_clone_target = res.get("ssh_url") or f"git@{gitea_host}:{actual_owner}/{dest_name}.git"
         if (Path.cwd() / ".git").is_dir():
             reconfigure_local_remotes(Path.cwd(), gitea_clone_target)
         elif not args.no_clone:
             clone_locally(
                 gitea_host=gitea_host,
-                user=gitea_owner,
+                user=actual_owner,
                 repo_name=dest_name,
                 target_dir=Path.cwd() / dest_name,
+                clone_url=gitea_clone_target,
+                ssh_key=creds.ssh_key,
             )
 
         print("\n🎉 Migration complete!")
@@ -1039,6 +1181,17 @@ def main() -> None:
         args.github_org.strip() if args.github_org and args.github_org.strip() else None
     )
     github_owner = github_org or creds.github_user
+
+    # Align with token authenticated user if targeting user namespace
+    if not target_org:
+        auth_user = gitea_client.get_authenticated_user()
+        if auth_user and auth_user.lower() != gitea_owner.lower():
+            print(
+                f"⚠️  Identity Warning: Gitea token belongs to '{auth_user}', but session persona is '{gitea_owner}'.\n"
+                f"   Aligning primary owner to token owner '{auth_user}'.",
+                file=sys.stderr,
+            )
+            gitea_owner = auth_user
 
     print(f"🚀 Initializing repository provisioning: '{gitea_owner}/{repo_name}'")
     print(f"   Visibility: {'Private' if is_private else 'Public'}")
@@ -1095,8 +1248,11 @@ def main() -> None:
                 license_name=args.license,
                 org=target_org,
             )
+
+        actual_owner = res.get("owner", {}).get("username") or gitea_owner
+        actual_clone_url = res.get("ssh_url") or f"git@{gitea_host}:{actual_owner}/{repo_name}.git"
         gitea_html_url = res.get(
-            "html_url", f"{creds.gitea_url}/{gitea_owner}/{repo_name}"
+            "html_url", f"{creds.gitea_url}/{actual_owner}/{repo_name}"
         )
         print(f"✅ Gitea repository created: {gitea_html_url}")
     except RuntimeError as e:
@@ -1128,7 +1284,7 @@ def main() -> None:
                 remote_password=creds.github_token,
                 sync_on_commit=True,
                 interval="8h",
-                owner=gitea_owner,
+                owner=actual_owner,
             )
             print("✅ Gitea push mirror registered (sync on commit enabled)")
         except RuntimeError as e:
@@ -1144,16 +1300,20 @@ def main() -> None:
     if is_existing_git:
         link_and_push_existing(
             gitea_host=gitea_host,
-            user=gitea_owner,
+            user=actual_owner,
             repo_name=repo_name,
             target_dir=target_dir,
+            clone_url=actual_clone_url,
+            ssh_key=creds.ssh_key,
         )
     elif not args.no_clone:
         clone_locally(
             gitea_host=gitea_host,
-            user=gitea_owner,
+            user=actual_owner,
             repo_name=repo_name,
             target_dir=target_dir,
+            clone_url=actual_clone_url,
+            ssh_key=creds.ssh_key,
         )
 
     # 5. Final Summary

@@ -38,7 +38,15 @@ class TestArgParsing(unittest.TestCase):
         self.assertIsNone(args.template)
         self.assertFalse(args.no_mirror)
         self.assertFalse(args.no_clone)
+        self.assertIsNone(args.as_persona)
         self.assertIsNone(args.migrate)
+
+    def test_as_persona_argument(self) -> None:
+        import sys
+
+        sys.argv = ["new-repo", "sample-project", "--as", "anneux"]
+        args = parse_args()
+        self.assertEqual(args.as_persona, "anneux")
 
     def test_migrate_arguments(self) -> None:
         import sys
@@ -284,6 +292,75 @@ class TestDotenvLoader(unittest.TestCase):
             self.assertEqual(loaded.get("GITEA_TOKEN"), "test-token-123")
             self.assertEqual(loaded.get("GITHUB_TOKEN"), "gh-token-456")
             self.assertEqual(loaded.get("GITEA_USER"), "custom-user")
+
+
+class TestTeaLoginParserAndPersonaResolution(unittest.TestCase):
+    """Test YAML block parsing of tea logins and persona identity resolution."""
+
+    def setUp(self) -> None:
+        self.sample_tea_yaml = (
+            "logins:\n"
+            "- name: kiskaadee\n"
+            "  url: https://gitea.roadtotech.me\n"
+            "  token: token-kiskaadee-123\n"
+            "  default: true\n"
+            "  user: kiskaadee\n"
+            "- name: anneux\n"
+            "  url: https://gitea.roadtotech.me\n"
+            "  token: token-anneux-456\n"
+            "  default: false\n"
+            "  ssh_key: /path/to/anne_key\n"
+            "  user: anneux\n"
+            "preferences:\n"
+            "  editor: false\n"
+        )
+
+    def test_parse_tea_logins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "config.yml"
+            cfg_path.write_text(self.sample_tea_yaml)
+            logins = SecretProvider._parse_tea_logins(cfg_path)
+            self.assertEqual(len(logins), 2)
+            self.assertEqual(logins[0]["name"], "kiskaadee")
+            self.assertTrue(logins[0]["default"])
+            self.assertEqual(logins[1]["name"], "anneux")
+            self.assertFalse(logins[1]["default"])
+            self.assertEqual(logins[1]["ssh_key"], "/path/to/anne_key")
+
+    def test_extract_tea_login_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tea_dir = Path(tmpdir) / ".config" / "tea"
+            tea_dir.mkdir(parents=True)
+            (tea_dir / "config.yml").write_text(self.sample_tea_yaml)
+            with patch("pathlib.Path.home", return_value=Path(tmpdir)):
+                token, url, user, ssh_key = SecretProvider._extract_tea_login(target_persona=None)
+                self.assertEqual(user, "kiskaadee")
+                self.assertEqual(token, "token-kiskaadee-123")
+                self.assertIsNone(ssh_key)
+
+    def test_extract_tea_login_by_persona(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tea_dir = Path(tmpdir) / ".config" / "tea"
+            tea_dir.mkdir(parents=True)
+            (tea_dir / "config.yml").write_text(self.sample_tea_yaml)
+            with patch("pathlib.Path.home", return_value=Path(tmpdir)):
+                token, url, user, ssh_key = SecretProvider._extract_tea_login(target_persona="anneux")
+                self.assertEqual(user, "anneux")
+                self.assertEqual(token, "token-anneux-456")
+                self.assertEqual(ssh_key, "/path/to/anne_key")
+
+    def test_extract_tea_login_missing_persona_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tea_dir = Path(tmpdir) / ".config" / "tea"
+            tea_dir.mkdir(parents=True)
+            (tea_dir / "config.yml").write_text(self.sample_tea_yaml)
+            with patch("pathlib.Path.home", return_value=Path(tmpdir)), self.assertRaises(SystemExit):
+                SecretProvider._extract_tea_login(target_persona="unknown-agent")
+
+    def test_gitea_client_get_authenticated_user(self) -> None:
+        client = GiteaClient("https://gitea.local", "kiskaadee", "secret-token")
+        with patch.object(client, "_request", return_value={"username": "kiskaadee"}):
+            self.assertEqual(client.get_authenticated_user(), "kiskaadee")
 
 
 class TestTargetParsing(unittest.TestCase):

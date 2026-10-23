@@ -44,6 +44,7 @@ Options:
   -t, --template        Optional Gitea template repository ('[owner/]template-name')
   -M, --no-mirror       Disable automatic offsite push mirroring to GitHub
   --no-clone            Skip cloning the repository locally after creation
+  --as PERSONA          Persona / login identity to provision as (matches tea login or SOPS persona, e.g. anneux)
   -h, --help            Show help message and exit
 ```
 
@@ -52,6 +53,9 @@ Options:
 ```bash
 # 1. Standard greenfield creation (Public Gitea + GitHub push mirror + Unlicense + auto-clone)
 new-repo service-api
+
+# 2. Provision as a specific agent persona (binds Gitea/GitHub credentials and SSH keys to persona)
+new-repo frontend-app --as anneux
 
 # 2. Provision under a Gitea organization (via shorthand or -o/--org flag; auto-creates org if missing)
 new-repo homelab/core
