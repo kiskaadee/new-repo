@@ -14,6 +14,7 @@ from new_repo import (
     GitHubClient,
     SecretProvider,
     determine_target,
+    normalize_license,
     parse_args,
     parse_github_target,
     reconfigure_local_remotes,
@@ -33,7 +34,7 @@ class TestArgParsing(unittest.TestCase):
         self.assertIsNone(args.org)
         self.assertIsNone(args.github_org)
         self.assertFalse(args.private)
-        self.assertEqual(args.license, "UNLICENSE")
+        self.assertEqual(args.license, "Unlicense")
         self.assertIsNone(args.template)
         self.assertFalse(args.no_mirror)
         self.assertFalse(args.no_clone)
@@ -88,6 +89,45 @@ class TestArgParsing(unittest.TestCase):
         self.assertTrue(args.no_mirror)
         self.assertTrue(args.no_clone)
         self.assertIsNone(args.migrate)
+
+
+class TestLicenseNormalization(unittest.TestCase):
+    """Test license identifier normalization against Gitea's registry."""
+
+    def test_unlicense_casing_variants(self) -> None:
+        self.assertEqual(normalize_license("UNLICENSE"), "Unlicense")
+        self.assertEqual(normalize_license("unlicense"), "Unlicense")
+        self.assertEqual(normalize_license("Unlicense"), "Unlicense")
+
+    def test_common_licenses_case_insensitivity(self) -> None:
+        self.assertEqual(normalize_license("mit"), "MIT")
+        self.assertEqual(normalize_license("MIT"), "MIT")
+        self.assertEqual(normalize_license("apache-2.0"), "Apache-2.0")
+        self.assertEqual(normalize_license("APACHE-2.0"), "Apache-2.0")
+        self.assertEqual(normalize_license("gpl-3.0"), "GPL-3.0")
+        self.assertEqual(normalize_license("bsd-3-clause"), "BSD-3-Clause")
+
+    def test_empty_and_whitespace_licenses(self) -> None:
+        self.assertEqual(normalize_license(""), "")
+        self.assertEqual(normalize_license("   "), "")
+        self.assertEqual(normalize_license(None), "")
+
+    def test_unrecognized_license_passthrough(self) -> None:
+        self.assertEqual(normalize_license("Custom-Proprietary"), "Custom-Proprietary")
+
+    def test_gitea_client_create_repo_normalizes_license(self) -> None:
+        client = GiteaClient("https://gitea.local", "kiskaadee", "secret-token")
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.create_repo("my-repo", license_name="UNLICENSE")
+            mock_req.assert_called_once()
+            payload = mock_req.call_args[0][2]
+            self.assertEqual(payload["license"], "Unlicense")
+
+        with patch.object(client, "_request", return_value={}) as mock_req:
+            client.create_repo("my-repo-no-license", license_name="")
+            mock_req.assert_called_once()
+            payload = mock_req.call_args[0][2]
+            self.assertNotIn("license", payload)
 
 
 class TestOrganizationAndTargetResolution(unittest.TestCase):

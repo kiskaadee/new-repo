@@ -217,6 +217,56 @@ class SecretProvider:
 
 
 # ==============================================================================
+# License Registry & Normalization
+# ==============================================================================
+
+GITEA_LICENSES: dict[str, str] = {
+    "0bsd": "0BSD",
+    "agpl-3.0": "AGPL-3.0",
+    "apache-2.0": "Apache-2.0",
+    "bsd-2-clause": "BSD-2-Clause",
+    "bsd-3-clause": "BSD-3-Clause",
+    "bsd-3-clause-clear": "BSD-3-Clause-Clear",
+    "bsl-1.0": "BSL-1.0",
+    "cc-by-4.0": "CC-BY-4.0",
+    "cc-by-sa-4.0": "CC-BY-SA-4.0",
+    "cc0-1.0": "CC0-1.0",
+    "epl-1.0": "EPL-1.0",
+    "epl-2.0": "EPL-2.0",
+    "eupl-1.2": "EUPL-1.2",
+    "gpl-2.0": "GPL-2.0",
+    "gpl-3.0": "GPL-3.0",
+    "isc": "ISC",
+    "lgpl-2.1": "LGPL-2.1",
+    "lgpl-3.0": "LGPL-3.0",
+    "mit": "MIT",
+    "mit-0": "MIT-0",
+    "mpl-2.0": "MPL-2.0",
+    "mulanpsl-2.0": "MulanPSL-2.0",
+    "ofl-1.1": "OFL-1.1",
+    "osl-3.0": "OSL-3.0",
+    "upl-1.0": "UPL-1.0",
+    "unlicense": "Unlicense",
+    "wtfpl": "WTFPL",
+    "zlib": "Zlib",
+}
+
+
+def normalize_license(license_name: str | None) -> str:
+    """Normalize license identifier to match Gitea's case-sensitive template registry.
+
+    Gitea resolves license templates by exact filename in its internal assets.
+    For example, 'UNLICENSE' fails with a 500 error while 'Unlicense' succeeds.
+    """
+    if not license_name:
+        return ""
+    clean = license_name.strip()
+    if not clean:
+        return ""
+    return GITEA_LICENSES.get(clean.lower(), clean)
+
+
+# ==============================================================================
 # API Clients
 # ==============================================================================
 
@@ -328,7 +378,7 @@ class GiteaClient:
         private: bool = False,
         description: str = "",
         auto_init: bool = True,
-        license_name: str = "UNLICENSE",
+        license_name: str = "Unlicense",
         org: str | None = None,
     ) -> dict[str, Any]:
         """Create a new repository under the authenticated user or specified organization."""
@@ -339,8 +389,9 @@ class GiteaClient:
             "auto_init": auto_init,
             "default_branch": "main",
         }
-        if license_name:
-            payload["license"] = license_name
+        normalized_license = normalize_license(license_name)
+        if normalized_license:
+            payload["license"] = normalized_license
 
         endpoint = f"/api/v1/orgs/{org}/repos" if org else "/api/v1/user/repos"
         return self._request("POST", endpoint, payload)
@@ -821,8 +872,8 @@ def parse_args() -> argparse.Namespace:
         "-l",
         "--license",
         type=str,
-        default="UNLICENSE",
-        help="License identifier template (default: UNLICENSE, pass empty string to disable)",
+        default="Unlicense",
+        help="License identifier template (default: Unlicense, pass empty string to disable)",
     )
     parser.add_argument(
         "-t",

@@ -40,7 +40,7 @@ Options:
   --migrate [URL]       Migrate an existing GitHub repo to Gitea with automated push mirroring (URL or auto-detect from local origin)
   -p, --private         Make repository private (default: public)
   -d, --description     Optional repository description string
-  -l, --license         License template identifier (default: UNLICENSE, pass "" to disable)
+  -l, --license         License template identifier (default: Unlicense, pass "" to disable)
   -t, --template        Optional Gitea template repository ('[owner/]template-name')
   -M, --no-mirror       Disable automatic offsite push mirroring to GitHub
   --no-clone            Skip cloning the repository locally after creation
@@ -50,7 +50,7 @@ Options:
 ### Examples
 
 ```bash
-# 1. Standard greenfield creation (Public Gitea + GitHub push mirror + UNLICENSE + auto-clone)
+# 1. Standard greenfield creation (Public Gitea + GitHub push mirror + Unlicense + auto-clone)
 new-repo service-api
 
 # 2. Provision under a Gitea organization (via shorthand or -o/--org flag; auto-creates org if missing)
